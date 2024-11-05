@@ -1,67 +1,83 @@
+from functools import partial
+from typing import NamedTuple
+
 import torch
-from nnsight import LanguageModel
-from transformers import AutoTokenizer
-
-from .compute_u import compute_u
-from .utils import sample_k
-from .compute_v import compute_v
-from .configs import RomeRequest, RomeConfig
+from torchtyping import TensorType
 
 
-GENERATION = {
-    "do_sample": True,
-    "top_k": 5,
-}
-TEMPLATE_CACHE = []
+STDEV = 0.094
 
 
-def execute_rome(
-    model: LanguageModel,
-    tok: AutoTokenizer,
-    req: RomeRequest,
-    cfg: RomeConfig,
-    verbose: bool = False,
-):
-    context_templates = _get_templates(model, tok)
+class CausalTracingInput(NamedTuple):
+    prompt: TensorType["seq"]
+    """Prompt tokens"""
 
-    for layer in [req.layer]:
-        left_vector: torch.Tensor = compute_u(model, tok, req, context_templates)
-        print("Left vector shape:", left_vector.shape) if verbose else None
-        right_vector: torch.Tensor = compute_v(
-            model, tok, req, cfg, left_vector, context_templates, verbose=verbose
-        )
-        print("Right vector shape:", right_vector.shape) if verbose else None
+    subject_idxs: TensorType["seq"]
+    """Subject tokens"""
 
+    target_id: TensorType["seq"]
+    """Target tokens"""
+
+
+def causal_trace(model, cfg: CausalTracingInput, n_iters: int = 5):
+    # Arange prompts for token-wise interventions
+    n_toks = len(cfg.prompt)
+    n_layers = len(model.transformer.h)
+    batch = cfg.prompt.repeat(n_toks, 1)
+
+    # Declare envoys
+    mlps = [layer.mlp for layer in model.transformer.h]
+    model_in = model.transformer.wte
+
+    def _window(layer, n_layers, window_size):
+        return max(0, layer - window_size), min(n_layers, layer + window_size + 1)
+
+    window = partial(_window, n_layers=n_layers, window_size=4)
+
+    # Create noise
+    noise = torch.randn(1, len(cfg.subject_idxs), 1600) * STDEV
+
+    # Initialize results
+    results = torch.zeros((len(model.transformer.h), n_toks), device=model.device)
+
+    for _ in range(n_iters):
         with torch.no_grad():
-            # Determine correct transposition of delta matrix
-            upd_matrix = left_vector.unsqueeze(1) @ right_vector.unsqueeze(0)
+            with model.trace(cfg.prompt):
+                clean_states = [
+                    mlps[layer_idx].output.cpu().save() for layer_idx in range(n_layers)
+                ]
 
-            module = model.transformer.h[layer].mlp.c_proj
-            upd_matrix = upd_matrix_match_shape(upd_matrix, module.weight.shape)
+            clean_states = torch.cat(clean_states, dim=0)
 
-    return upd_matrix
+            with model.trace(cfg.prompt):
+                model_in.output[:, cfg.subject_idxs] += noise
 
+                corr_logits = model.lm_head.output.softmax(-1)[
+                    :, -1, cfg.target_id
+                ].save()
 
-def _get_templates(model: LanguageModel, tok: AutoTokenizer):
-    global TEMPLATE_CACHE
+            for layer_idx in range(n_layers):
+                s, e = window(layer_idx)
+                with model.trace(batch):
+                    model_in.output[:, cfg.subject_idxs] += noise
 
-    if not TEMPLATE_CACHE:
-        print("Generating templates...")
-        TEMPLATE_CACHE.extend(sample_k(model, tok, 10, max_new_tokens=10, **GENERATION))
-        TEMPLATE_CACHE.extend(sample_k(model, tok, 10, max_new_tokens=5, **GENERATION))
+                    for token_idx in range(n_toks):
+                        s, e = window(layer_idx)
+                        for l in range(s, e):
+                            mlps[l].output[token_idx, token_idx, :] = clean_states[
+                                l, token_idx, :
+                            ]
 
-    return TEMPLATE_CACHE
+                    restored_logits = model.lm_head.output.softmax(-1)[
+                        :, -1, cfg.target_id
+                    ]
 
+                    diff = restored_logits - corr_logits
 
-def upd_matrix_match_shape(matrix: torch.Tensor, shape: torch.Size) -> torch.Tensor:
-    """
-    GPT-2 and GPT-J have transposed weight representations.
-    Returns a matrix that matches the desired shape, else raises a ValueError
-    """
+                    diff.save()
 
-    if matrix.shape == shape:
-        return matrix
-    elif matrix.T.shape == shape:
-        return matrix.T
-    else:
-        raise ValueError("Matrix shape does not match desired shape")
+                results[layer_idx, :] += diff.value
+
+    results = results.detach().cpu()
+
+    return results
