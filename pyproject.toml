@@ -11,6 +11,12 @@ dependencies = [
     "nnsight>=0.3.6",
     "torch>=2.5.1",
     "torchtyping>=0.1.5",
+    "transformers>=4.46.2",
+]
+
+[project.optional-dependencies]
+ruff = [
+    "ipykernel>=6.29.5",
 ]
 
 [build-system]

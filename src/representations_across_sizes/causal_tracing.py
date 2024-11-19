@@ -1,10 +1,11 @@
 from functools import partial
 from typing import NamedTuple
+from copy import deepcopy
+from typing import List, Literal
 
+from transformers import AutoTokenizer
 import torch
 from torchtyping import TensorType
-
-
 
 
 STDEV = 0.094
@@ -51,7 +52,8 @@ def causal_trace_llama(model, cfg: CausalTracingInput, n_iters: int = 5):
         with torch.no_grad():
             with model.trace(cfg.prompt):
                 clean_states = [
-                    mlps[layer_idx].down_proj.output.cpu().save() for layer_idx in range(n_layers)
+                    mlps[layer_idx].down_proj.output.cpu().save()
+                    for layer_idx in range(n_layers)
                 ]
 
             clean_states = torch.cat(clean_states, dim=0)
@@ -71,9 +73,9 @@ def causal_trace_llama(model, cfg: CausalTracingInput, n_iters: int = 5):
                     for token_idx in range(n_toks):
                         s, e = window(layer_idx)
                         for l in range(s, e):
-                            mlps[l].down_proj.output[token_idx, token_idx, :] = clean_states[
-                                l, token_idx, :
-                            ]
+                            mlps[l].down_proj.output[token_idx, token_idx, :] = (
+                                clean_states[l, token_idx, :]
+                            )
 
                     restored_logits = model.lm_head.output.softmax(-1)[
                         :, -1, cfg.target_id
@@ -89,3 +91,122 @@ def causal_trace_llama(model, cfg: CausalTracingInput, n_iters: int = 5):
 
     return results
 
+def format_template(
+    tok: AutoTokenizer,
+    context_templates: List[str],
+    words: str,
+    subtoken: Literal["last", "all"] = "last",
+) -> int:
+    """
+    Given list of template strings, each with *one* format specifier
+    (e.g. "{} plays basketball"), and words to be substituted into the
+    template, computes the post-tokenization index of their last tokens.
+    """
+
+    assert all(
+        tmp.count("{}") == 1 for tmp in context_templates
+    ), "Multiple fill-ins not supported."
+
+    # assert subtoken == "last", "Only last token retrieval supported."
+
+    # Compute prefixes and suffixes of the tokenized context
+    prefixes, suffixes = _split_templates(context_templates)
+    _words = deepcopy(words)
+
+    # Compute lengths of prefixes, words, and suffixes
+    prefixes_len, words_len, suffixes_len = _get_split_lengths(
+        tok, prefixes, _words, suffixes
+    )
+
+    # Format the prompts bc why not
+    input_tok = tok(
+        [template.format(word) for template, word in zip(context_templates, words)],
+        return_tensors="pt",
+        padding=True,
+    )
+
+    size = input_tok["input_ids"].size(1)
+    padding_side = tok.padding_side
+
+    if subtoken == "all":
+        word_idxs = [
+            [prefixes_len[i] + _word_len for _word_len in range(words_len[i])]
+            for i in range(len(prefixes))
+        ]
+
+        return input_tok, word_idxs
+
+    # Compute indices of last tokens
+    elif padding_side == "right":
+        word_idxs = [prefixes_len[i] + words_len[i] - 1 for i in range(len(prefixes))]
+
+        return input_tok, word_idxs
+
+    elif padding_side == "left":
+        word_idxs = [size - suffixes_len[i] - 1 for i in range(len(prefixes))]
+
+        return input_tok, word_idxs
+
+def prepend_bos(input, bos_token):
+    batch_size = input.size(0)
+    bos_tensor = torch.full((batch_size, 1), bos_token, dtype=input.dtype)
+    output = torch.cat((bos_tensor, input), dim=1)
+    return output
+
+def load_fact(tokenizer, req):
+    raw_prompt = req["prompt"]
+    subject = req["subject"]
+    target = req["target_true"]["str"]
+
+    print(f"RAW: |{raw_prompt}|")
+    print(f"SUBJECT: |{subject}|")
+    print(f"TARGET: |{target}|")
+
+    input_tok, subject_idxs = format_template(
+        tokenizer, [raw_prompt], [subject], subtoken="all"
+    )
+
+    prompt = prepend_bos(input_tok["input_ids"], tokenizer.bos_token_id)[0]
+    target_token = tokenizer.encode(" " + target, return_tensors="pt")[0].item()
+
+    return CausalTracingInput(
+        prompt=prompt,
+        subject_idxs=[i + 1 for i in subject_idxs[0]],  # Adj for prepended BOS
+        target_id=target_token,
+    )
+
+
+def _get_split_lengths(tok, prefixes, words, suffixes):
+    # Pre-process tokens to account for different 
+    # tokenization strategies
+    for i, prefix in enumerate(prefixes):
+        if len(prefix) > 0:
+            assert prefix[-1] == " "
+            prefix = prefix[:-1]
+
+            prefixes[i] = prefix
+            words[i] = f" {words[i].strip()}"
+
+    # Tokenize to determine lengths
+    assert len(prefixes) == len(words) == len(suffixes)
+    n = len(prefixes)
+    batch_tok = tok([*prefixes, *words, *suffixes])
+
+    prefixes_tok, words_tok, suffixes_tok = [
+        batch_tok[i : i + n] for i in range(0, n * 3, n)
+    ]
+    prefixes_len, words_len, suffixes_len = [
+        [len(el) for el in tok_list]
+        for tok_list in [prefixes_tok, words_tok, suffixes_tok]
+    ]
+
+    return prefixes_len, words_len, suffixes_len
+
+
+def _split_templates(context_templates):
+    # Compute prefixes and suffixes of the tokenized context
+    fill_idxs = [tmp.index("{}") for tmp in context_templates]
+    prefixes = [tmp[: fill_idxs[i]] for i, tmp in enumerate(context_templates)]
+    suffixes = [tmp[fill_idxs[i] + 2 :] for i, tmp in enumerate(context_templates)]
+
+    return prefixes, suffixes
