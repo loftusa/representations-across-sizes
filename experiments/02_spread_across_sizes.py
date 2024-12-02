@@ -4,72 +4,68 @@ import torch
 import numpy as np
 import os
 from nnsight import LanguageModel, CONFIG
-from jaxtyping import Float, jaxtyped
+from jaxtyping import Float
 from torch import Tensor
-from typeguard import typechecked
 import lovely_tensors as lt
 from dotenv import load_dotenv
-import nnsight
-from tqdm import tqdm
-from beartype import beartype
-lt.monkey_patch()
-
+from pathlib import Path
+# lt.monkey_patch()
+import gc
 np.random.seed(0)
 load_dotenv()
 API_KEY = os.getenv("NNSIGHT_API_KEY")
 CONFIG.set_default_api_key(API_KEY)
 print(API_KEY)
 
+from safetensors.torch import save_file
+
 # This experiment measures the dirichlet energy of representations as a function of the layer. We first reconstruct figure 4 from https://openreview.net/pdf?id=pXlmOmlHJZ
 
-model = "meta-llama/Meta-Llama-3.1-8B"
-lm = LanguageModel(model, device_map='auto')
-context_length = 16
-words = np.array(["apple", "bird", "car", "egg", "house", "milk", "plane", "opera", "box", "sand", "sun", "mango", "rock", "math", "code", "phone"])
-prompts = [" ".join(list(np.random.choice(words, size=context_length))) for _ in range(1000)]
 
 
-@jaxtyped(typechecker=beartype)
-def dirichlet_energy(representations: Float[Tensor, "b n d"]) -> Float[Tensor, "b"]:
-    """Calculate the Dirichlet energy between all pairs of representations.
 
-    The Dirichlet energy is defined as the sum of squared L2 distances between
-    all pairs of connected representations. Here we assume all representations
-    are connected to each other.
+def get_energies(lm, remote=True):
+    n_prompts = len(prompts)
+    with lm.session(remote=remote) as session:
+        n_layers = len(lm.model.layers)
+        energies: Float[Tensor, "n"] = torch.zeros(n_layers).save()
 
-    Args:
-      representations: Tensor of shape (B, N, D) containing B batches of N D-dimensional representations
+        # Let invoke handle the batching internally
+        # two batches of n_prompts//2
+        with lm.trace() as tracer:
+            with tracer.invoke(prompts[n_prompts // 2 :]) as invoker:
+                for layer_idx, layer in enumerate(lm.model.layers):
+                    energies[layer_idx] += dirichlet_energy(layer.output[0]).mean().item()
 
-    Returns:
-      Scalar tensor containing the total Dirichlet energy
-    """
-    outer_product_difference: Float[Tensor, "b n n d"] = (
-        representations.unsqueeze(2) - representations.unsqueeze(1)
-    )
-    squared_distances: Float[Tensor, "b n n"] = torch.sum(
-        outer_product_difference**2, dim=-1
-    )
-    return torch.sum(squared_distances, dim=(1, 2)) / 2
-#%%
-
-prompt = prompts[0]
-with lm.trace() as tracer:
-  all_layers = nnsight.list().save()
-  for i, layer in tqdm(enumerate(lm.model.layers)):
-    per_layer_prompt = []
-    for prompt in prompts:
-      with tracer.invoke(prompt) as invoker:
-        per_layer_prompt.append(layer.output[0])
-    all_layers.append(per_layer_prompt)
-
-#%%
-all_layers = torch.stack([torch.stack(l) for l in all_layers.value])
-#%%
+        with lm.trace() as tracer:
+            with tracer.invoke(prompts[: n_prompts // 2]) as invoker:
+                for layer_idx, layer in enumerate(lm.model.layers):
+                    energies[layer_idx] += dirichlet_energy(layer.output[0]).mean().item()
 
 
-# energies = [dirichlet_energy(all_layers[i].squeeze()).mean().item() for i in range(all_layers.shape[0])]
-# %%
-import seaborn as sns
-sns.lineplot(x=list(range(len(energies))), y=energies)
+        # Scale the final result
+        energies /= len(prompts)
+        energies = energies.save()
+    return energies.value.to(float).numpy(force=True)
 
-#%%
+if __name__ == "__main__":
+  # get 1b, 3b, and 8b models
+  context_length = 16
+  words = np.array(["apple", "bird", "car", "egg", "house", "milk", "plane", "opera", "box", "sand", "sun", "mango", "rock", "math", "code", "phone"])
+  prompts = [" ".join(list(np.random.choice(words, size=context_length))) for _ in range(10)]
+  models = {
+      "1b": "meta-llama/Llama-3.2-1B",
+      "3b": "meta-llama/Llama-3.2-3B",
+      "8b": "meta-llama/Meta-Llama-3.1-8B",
+  }
+
+  save_loc = Path("results")
+  save_loc.mkdir(exist_ok=True)
+  for model_name, model_size in models.items():
+    print(f"Getting energies for {model_name}")
+    lm = LanguageModel(model_size, device_map="auto")
+    remote = True if model_name == "8b" else False
+    energies = get_energies(lm, remote=remote)
+    print(energies)
+    save_file({"energies": torch.tensor(energies)}, save_loc / f"{model_name}.safetensors")
+
