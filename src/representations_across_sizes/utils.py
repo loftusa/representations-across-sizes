@@ -44,7 +44,7 @@ def get_activation_cache(
         dataset: List[str],
         layer_idxs: List[int] = [12, 20],
         llm_batch_size: int = 32,
-    ) -> torch.Tensor:
+    ) -> dict[int, list[torch.Tensor]]:
     """
     Compute the activation cache for a specific entity across all samples.
     
@@ -73,8 +73,9 @@ def get_activation_cache(
             for layer in layer_idxs:
                 resid_post_module = model.model.layers[layer]
                 resid_post_BLD = resid_post_module.output[0] # residual stream is a weird tuple so we have to zero index it
-                resid_post_BLD.save() # indicate we wanna use this tensor outside tracing context
+                resid_post_BLD = resid_post_BLD.to('cpu').save() # indicate we wanna use this tensor outside tracing context
                 cache[layer].append(resid_post_BLD)
+            
 
     # for layer in layer_idxs:
     #     cache[layer] = torch.cat(cache[layer], dim=0)
