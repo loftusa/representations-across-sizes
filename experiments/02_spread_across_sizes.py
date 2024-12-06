@@ -21,9 +21,6 @@ from safetensors.torch import save_file
 
 # This experiment measures the dirichlet energy of representations as a function of the layer. We first reconstruct figure 4 from https://openreview.net/pdf?id=pXlmOmlHJZ
 
-
-
-
 def get_energies(lm, remote=True):
     n_prompts = len(prompts)
     with lm.session(remote=remote) as session:

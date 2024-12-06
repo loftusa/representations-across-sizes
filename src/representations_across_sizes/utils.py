@@ -1,3 +1,4 @@
+from tqdm import tqdm
 from typeguard import typechecked
 from torchtyping import TensorType
 import torch
@@ -6,7 +7,9 @@ from torch import Tensor
 from jaxtyping import Float
 
 from nnsight.models.LanguageModel import LanguageModelProxy
+from nnsight import LanguageModel
 
+from typing import List
 
 # @typechecked
 def dirichlet_energy(representations: Float[Tensor | LanguageModelProxy, "b n d"]) -> Float[Tensor | LanguageModelProxy, "b"]:  # noqa
@@ -34,6 +37,49 @@ def dirichlet_energy(representations: Float[Tensor | LanguageModelProxy, "b n d"
 
     # Return the Dirichlet energy
     return torch.sum(squared_distances, dim=(1, 2)) / 2
+
+
+def get_activation_cache(
+        model: LanguageModel, 
+        dataset: List[str],
+        layer_idxs: List[int] = [12, 20],
+        llm_batch_size: int = 32,
+    ) -> torch.Tensor:
+    """
+    Compute the activation cache for a specific entity across all samples.
+    
+    Args:
+        model: The language model
+        dataset: List of dataset samples, untokenized string contexts
+        layer: Model layer to extract activations from
+        llm_batch_size: Batch size for processing
+
+    Dimension annotations:
+    - B: Batch size
+    - L: Sequence length
+    - D: Hidden dimension
+    """
+
+    cache = {layer_idx: [] for layer_idx in layer_idxs} # could be done with defaultdict
+    
+    # Create progress bar
+    for batch_idx in tqdm(range(0, len(dataset), llm_batch_size)):
+        torch.cuda.empty_cache()
+        batch_str = dataset[batch_idx:batch_idx + llm_batch_size]
+
+        # Get activations
+        tracer_kwargs = {'scan': False, 'validate': False}
+        with torch.no_grad(), model.trace(batch_str, **tracer_kwargs):
+            for layer in layer_idxs:
+                resid_post_module = model.model.layers[layer]
+                resid_post_BLD = resid_post_module.output[0] # residual stream is a weird tuple so we have to zero index it
+                resid_post_BLD.save() # indicate we wanna use this tensor outside tracing context
+                cache[layer].append(resid_post_BLD)
+
+    # for layer in layer_idxs:
+    #     cache[layer] = torch.cat(cache[layer], dim=0)
+            
+    return cache
 
 
 def pretty_size(size):

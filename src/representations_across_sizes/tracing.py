@@ -210,3 +210,43 @@ def _split_templates(context_templates):
     suffixes = [tmp[fill_idxs[i] + 2 :] for i, tmp in enumerate(context_templates)]
 
     return prefixes, suffixes
+
+
+def get_activation_cache(
+        model: LanguageModel, 
+        dataset: List[str],
+        layer_idxs: int = [12, 20],
+        llm_batch_size: int = 32,
+    ) -> dict:
+    """
+    Compute the activation cache for a specific entity across all samples.
+    
+    Args:
+        model: The language model
+        dataset: List of dataset samples, untokenized string contexts
+        layer_idxs: Model layers to extract activations from
+        llm_batch_size: Batch size for processing
+
+    Dimension annotations:
+    - B: Batch size
+    - L: Sequence length
+    - D: Hidden dimension
+    """
+
+    cache = {layer_idx: [] for layer_idx in layer_idxs} # could be done with defaultdict
+    
+    # Create progress bar
+    for batch_idx in range(0, len(dataset), llm_batch_size):
+        torch.cuda.empty_cache()
+        batch_str = dataset[batch_idx:batch_idx + llm_batch_size]
+
+        # Get activations
+        tracer_kwargs = {'scan': False, 'validate': False}
+        with torch.no_grad(), model.trace(batch_str, **tracer_kwargs):
+            for layer in layer_idxs:
+                resid_post_module = model.model.layers[layer]
+                resid_post_BLD = resid_post_module.output[0] # residual stream is a weird tuple so we have to zero index it
+                resid_post_BLD.save() # indicate we wanna use this tensor outside tracing context
+                cache[layer].append(resid_post_BLD)
+            
+    return cache

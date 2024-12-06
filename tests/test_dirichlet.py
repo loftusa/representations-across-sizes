@@ -3,18 +3,18 @@ from representations_across_sizes.utils import dirichlet_energy
 
 def test_dirichlet_energy():
     # Test with zero matrix should give 0 energy
-    zero_points = torch.zeros((5, 3))
+    zero_points = torch.zeros((1, 5, 3))
     assert dirichlet_energy(zero_points) == 0
 
-    # Test with constant matrix should give 0 energy
-    constant_points = torch.full((4, 2), fill_value=3.14)
+    # Test with constant matrix should give 0 energy 
+    constant_points = torch.full((1, 4, 2), fill_value=3.14)
     assert dirichlet_energy(constant_points) == 0
 
-    points = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    points = torch.tensor([[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]])
     # Test symmetry - energy should be the same if we permute the points
-    points1 = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    points1 = torch.tensor([[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]])
     points2 = torch.tensor(
-        [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]
+        [[[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]]
     )  # same points, different order
     assert torch.allclose(dirichlet_energy(points1), dirichlet_energy(points2))
 
@@ -30,11 +30,11 @@ def test_dirichlet_energy():
     assert torch.allclose(dirichlet_energy(points), dirichlet_energy(translated_points))
 
     # Test with higher dimensions
-    high_dim_points = torch.randn(5, 10)  # 5 points in 10D space
+    high_dim_points = torch.randn(1, 5, 10)  # 5 points in 10D space
     assert (
         dirichlet_energy(high_dim_points) >= 0
     )  # energy should always be non-negative
 
     # Test with single point - should return 0
-    single_point = torch.randn(1, 3)
+    single_point = torch.randn(1, 1, 3)
     assert dirichlet_energy(single_point) == 0
