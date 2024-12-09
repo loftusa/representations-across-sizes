@@ -88,6 +88,7 @@ if __name__ == "__main__":
                     if DEBUG:
                         sequence = sequence[:10]
                     if shuffled:
+                        print("Shuffling sequence")
                         sequence = shuffle_sequence(sequence)
                     print(sequence[0])
                     ids = get_id_results(sequence, model_path, save=False)
