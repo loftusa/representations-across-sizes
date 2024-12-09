@@ -44,6 +44,7 @@ def get_activation_cache(
         dataset: List[str],
         layer_idxs: List[int] = [12, 20],
         llm_batch_size: int = 32,
+        remote: bool = False,
     ) -> dict[int, list[torch.Tensor]]:
     """
     Compute the activation cache for a specific entity across all samples.
@@ -68,7 +69,7 @@ def get_activation_cache(
         batch_str = dataset[batch_idx:batch_idx + llm_batch_size]
 
         # Get activations
-        tracer_kwargs = {'scan': False, 'validate': False}
+        tracer_kwargs = {'scan': False, 'validate': False, 'remote': remote}
         with torch.no_grad(), model.trace(batch_str, **tracer_kwargs):
             for layer in layer_idxs:
                 resid_post_module = model.model.layers[layer]

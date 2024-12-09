@@ -1,46 +1,64 @@
-#%%
-from representations_across_sizes.utils import dirichlet_energy
 from representations_across_sizes.gride import calculate_gride_id, get_sequences
 import torch
 import numpy as np
 from nnsight import LanguageModel
-from datasets import load_dataset
 from pathlib import Path
 import gc
 np.random.seed(0)
 
+from representations_across_sizes.utils import get_activation_cache
+from torch import Tensor
+import dotenv
+import os
+from datetime import datetime
+import json
+dotenv.load_dotenv()
 
+RESULTS_DIR = Path(os.getenv("RESULTS_DIR"))
 
-def get_layer_ids(lm, prompts, remote=True):
-    """Get intrinsic dimensionality for each layer's activations"""
-    with lm.session(remote=remote) as session:
-        n_layers = len(lm.model.layers)
-        ids = torch.zeros(n_layers).save()
+def get_id_results(dataset: list[str], model_path: str, remote: bool = False, save=False):
+    lm = LanguageModel(model_path, device_map="auto")
 
-        # Process in batches to handle memory
-        batch_size = 100
-        for i in range(0, len(prompts), batch_size):
-            batch_prompts = prompts[i:i + batch_size]
-            
-            with lm.trace(scan=True, validate=True) as tracer:
-                with tracer.invoke(batch_prompts) as invoker:
-                    for layer_idx, layer in enumerate(lm.model.layers):
-                        # Get last token activation for each sequence in batch
-                        last_token_activation = layer.output[0][:,-1,:]
-                        # Add to collection of points for this layer
-                        if i == 0:
-                            layer_points = last_token_activation
-                        else:
-                            layer_points = torch.cat([layer_points, last_token_activation])
-                            
-                    # Calculate ID using GRIDE (add batch dim of 1)
-                    print(layer_points.shape)
-                    ids[layer_idx] = calculate_gride_id(layer_points.unsqueeze(0))[0]
+    activations = get_activation_cache(
+        lm,
+        layer_idxs=list(range(len(lm.model.layers))),
+        dataset=dataset,
+        llm_batch_size=64,
+        remote=remote,
+    )
+    results = {}
+    for layer, acts in activations.items():
+        acts: list[Tensor] = [act[:, -1, :] for act in acts]
+        activations[layer] = torch.cat(acts, dim=0)
 
-        ids = ids.save()
-    return ids.value.to(float).cpu().numpy(force=True)
+    for layer, acts in activations.items():
+        ids_scaling, ids_scaling_err, rs_scaling = calculate_gride_id(acts.to("cpu"))
+        results[layer] = ids_scaling.mean()
+
+    # Save results if path provided
+    save_path = RESULTS_DIR / f"{model_path}.json"
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    if save:
+        # Save results with model name and timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_to_save = {
+        "model": model_path,
+        "timestamp": timestamp,
+            "intrinsic_dimensions": results,
+        }
+
+        with open(save_path, "w") as f:
+            json.dump(results_to_save, f, indent=2)
+    return results
+
+def shuffle_sequence(sequence: list[str]) -> list[str]:
+    """for every string in the sequence, shuffle all the words"""
+    return [
+        " ".join(np.random.permutation(string.split())) for string in sequence
+    ]
 
 if __name__ == "__main__":
+    DEBUG = False
     # Following paper's setup
     datasets = ["bookcorpus", "pile", "wikitext"]
     models = {
@@ -59,16 +77,32 @@ if __name__ == "__main__":
         
         for model_name, model_path in models.items():
             print(f"Getting IDs for {model_name}")
-            lm = LanguageModel(model_path, device_map="auto")
-            remote = True if model_name == "8b" else False
             
             # Calculate IDs
-            ids = get_layer_ids(lm, sequences, remote=remote)
-            
-            # Save results
-            save_file = save_loc / f"{model_name}_{dataset_name}_ids.safetensors"
-            torch.save({"ids": torch.tensor(ids)}, save_file)
-            
-            del lm
-            gc.collect()
-            torch.cuda.empty_cache()
+            for shuffled in [True, False]:
+                for i, sequence in enumerate(sequences):
+                    save_path = RESULTS_DIR / f"{model_path}_{dataset_name}_{i}{'_shuffled' if shuffled else ''}.json"
+                    if save_path.exists():
+                        print(f"Skipping {save_path} because it already exists")
+                        continue
+                    if DEBUG:
+                        sequence = sequence[:10]
+                    if shuffled:
+                        sequence = shuffle_sequence(sequence)
+                    print(sequence[0])
+                    ids = get_id_results(sequence, model_path, save=False)
+                    # Save results with model name and timestamp
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    results_to_save = {
+                    "model": model_path,
+                    "timestamp": timestamp,
+                        "intrinsic_dimensions": ids,
+                    }
+
+                    save_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(save_path, "w") as f:
+                        json.dump(results_to_save, f, indent=2)
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+     

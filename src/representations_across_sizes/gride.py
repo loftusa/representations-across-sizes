@@ -26,7 +26,7 @@ RESULTS_DIR = Path(os.getenv("RESULTS_DIR"))
 
 
 def get_id_results(dataset: List[str], model_name: str = "meta-llama/Llama-3.2-1B"):
-    lm = LanguageModel(model, device_map="auto")
+    lm = LanguageModel(model_name, device_map="auto")
 
     activations = get_activation_cache(
         lm,
@@ -222,7 +222,7 @@ def calculate_intrinsic_dimension(
     return result
 
 
-def get_sequences(dataset_name, num_sequences=10000, seq_length=20, num_partitions=5):
+def get_sequences(dataset_name, num_sequences=10000, seq_length=20, num_partitions=5) -> List[List[str]]:
     """Get sequences from dataset following paper's methodology"""
     if dataset_name == "bookcorpus":
         dataset = load_dataset("bookcorpus/bookcorpus", split="train")
